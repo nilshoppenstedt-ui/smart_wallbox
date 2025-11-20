@@ -6,10 +6,10 @@ from flask import Flask, jsonify, Response, request
 
 from goecharger_api_lite import GoeCharger
 
-from grid_meter import GridMeter, GridMeterError
-from pv_inverter import PVInverter, PVInverterError
-from wallbox import Wallbox, WallboxError
-from surplus_controller import SurplusController, ControllerParams
+from .grid_meter import GridMeter, GridMeterError
+from .pv_inverter import PVInverter, PVInverterError
+from .wallbox import Wallbox, WallboxError
+from .surplus_controller import SurplusController, ControllerParams
 
 
 # ---------------------------------------------------------------------------

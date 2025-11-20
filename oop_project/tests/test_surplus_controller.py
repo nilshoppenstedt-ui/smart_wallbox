@@ -1,6 +1,6 @@
 import pytest
 
-from surplus_controller import SurplusController, ControllerParams
+from smart_home.surplus_controller import SurplusController, ControllerParams
 
 
 def test_surplus_controller_no_surplus():

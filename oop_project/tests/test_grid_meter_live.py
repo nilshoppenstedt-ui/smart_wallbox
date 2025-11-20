@@ -1,5 +1,5 @@
 import pytest
-from grid_meter import GridMeter, GridMeterError
+from smart_home.grid_meter import GridMeter, GridMeterError
 
 # IP-Adresse deines Lesekopfes
 GRID_IP = "192.168.178.191"

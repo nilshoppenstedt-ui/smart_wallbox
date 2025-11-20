@@ -1,6 +1,6 @@
 import pytest
 
-from wallbox import Wallbox, WallboxError
+from smart_home.wallbox import Wallbox, WallboxError
 
 WALLBOX_IP = "192.168.178.21"
 

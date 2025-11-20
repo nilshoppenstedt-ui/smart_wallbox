@@ -1,6 +1,6 @@
 import pytest
 
-from pv_inverter import PVInverter, PVInverterError
+from smart_home.pv_inverter import PVInverter, PVInverterError
 
 # IP/Port/Unit wie in deinem bisherigen Skript
 PV_IP = "192.168.178.56"
