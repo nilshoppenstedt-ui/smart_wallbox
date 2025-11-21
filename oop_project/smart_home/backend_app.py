@@ -1,6 +1,7 @@
 import threading
 import time
 from datetime import datetime
+import asyncio
 
 from flask import Flask, jsonify, Response, request
 
@@ -43,6 +44,14 @@ class AppState:
     """
 
     def __init__(self):
+
+        # ensure asyncio event loop for aiohttp / GoeCharger (Python 3.11+)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
         # Geräte
         self.grid_meter = GridMeter(GRID_IP)
         self.pv_inv     = PVInverter(PV_IP, port=PV_PORT, unit_id=PV_UNIT)
