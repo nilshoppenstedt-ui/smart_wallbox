@@ -11,6 +11,8 @@ from .grid_meter import GridMeter, GridMeterError
 from .pv_inverter import PVInverter, PVInverterError
 from .wallbox import Wallbox, WallboxError
 from .surplus_controller import SurplusController, ControllerParams
+from .car_client import CarClient, CarClientError
+
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +30,8 @@ SAMPLE_INTERVAL_SEC = 1
 GRID_SAMPLE_EVERY   = 10
 CONTROL_PERIOD_SEC  = 300
 MAX_GRID_SAMPLES    = CONTROL_PERIOD_SEC // GRID_SAMPLE_EVERY  # ~30
+CAR_STATUS_PERIOD_SEC = 300  # alle 5 Min Fahrzeugstatus holen
+
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +63,13 @@ class AppState:
         self.controller = SurplusController(ControllerParams())
         self.charger    = GoeCharger(WB_IP)
 
+        # CarClient (Renault)
+        self.car_client = None
+        try:
+            self.car_client = CarClient()
+        except CarClientError as e:
+            print(f"[Warn] CarClient not initialized: {e}")
+
         # Zustand für Mittelung
         self.grid_samples: list[float] = []
         self.counter: int = 0
@@ -80,6 +91,13 @@ class AppState:
             "current": None,            # Live-Strom der WB
             "mode": "pv_surplus",       # oder "monitor_only"
             "car_state": None,
+
+            # Fahrzeugstatus (Renault)
+            "car_soc": None,
+            "car_autonomy_km": None,
+            "car_plug_status": None,
+            "car_charging_status": None,
+            "car_status_timestamp": None,
         }
 
         self.lock = threading.Lock()
@@ -172,6 +190,32 @@ class AppState:
             self.status["current"] = current_live
             # grid_kw_avg, wb_kw_avg, p_available_kw werden im Control-Step gesetzt
 
+    def update_car_status(self) -> None:
+        """Fetch car battery status via CarClient and update status dict.
+
+        Wird im Hintergrundthread alle CAR_STATUS_PERIOD_SEC Sekunden aufgerufen.
+        """
+        # Wenn kein CarClient existiert (z.B. keine Credentials): nichts tun
+        if self.car_client is None:
+            return
+
+        try:
+            car_status = self.car_client.read_status()
+        except CarClientError as e:
+            print(f"[Warn] Car status read error: {e}")
+            # nur Zeitstempel aktualisieren, damit man sieht, dass es versucht wurde
+            with self.lock:
+                self.status["car_status_timestamp"] = datetime.now().isoformat(timespec="seconds")
+            return
+
+        with self.lock:
+            self.status["car_soc"]             = car_status.soc
+            self.status["car_autonomy_km"]     = car_status.autonomy_km
+            self.status["car_plug_status"]     = car_status.plug_status
+            self.status["car_charging_status"] = car_status.charging_status
+            self.status["car_status_timestamp"] = car_status.timestamp.isoformat(timespec="seconds")
+
+
     # ------------------------------------------------------------------
     # Hauptschleife (Background-Thread)
     # ------------------------------------------------------------------
@@ -191,6 +235,10 @@ class AppState:
 
                     if len(self.grid_samples) > MAX_GRID_SAMPLES:
                         self.grid_samples = self.grid_samples[-MAX_GRID_SAMPLES:]
+
+                # Fahrzeugstatus alle CAR_STATUS_PERIOD_SEC Sekunden aktualisieren
+                if self.counter % CAR_STATUS_PERIOD_SEC == 0:
+                    self.update_car_status()
 
                 # Modus abfragen
                 mode = self.get_mode()
@@ -533,6 +581,23 @@ HTML_PAGE = """
             </div>
             <div class="label">Ist-Phase und Ist-Strom der Wallbox</div>
         </div>
+        <div class="card">
+            <div class="card-title">Fahrzeug</div>
+            <div class="value">
+                <span id="car_soc">–</span>
+                <span class="unit">%</span>
+            </div>
+            <div class="sub">
+                Reichweite: <span id="car_autonomy">–</span> km
+            </div>
+            <div class="sub small">
+                Plug: <span id="car_plug_status">–</span> |
+                Charging: <span id="car_charging_status">–</span>
+            </div>
+            <div class="sub small">
+                Stand: <span id="car_status_timestamp">–</span>
+            </div>
+        </div>
     </div>
 </main>
 <footer>
@@ -588,6 +653,31 @@ HTML_PAGE = """
         // Car state
         const carStateElem = document.getElementById("car_state");
         carStateElem.textContent = data.car_state || "unbekannt";
+
+        // Fahrzeugstatus
+        if (data.car_soc != null) {
+        document.getElementById("car_soc").textContent = data.car_soc.toFixed
+            ? data.car_soc.toFixed(0)
+            : data.car_soc;
+        } else {
+        document.getElementById("car_soc").textContent = "–";
+        }
+
+        if (data.car_autonomy_km != null) {
+        document.getElementById("car_autonomy").textContent = data.car_autonomy_km;
+        } else {
+        document.getElementById("car_autonomy").textContent = "–";
+        }
+
+        document.getElementById("car_plug_status").textContent =
+        data.car_plug_status != null ? data.car_plug_status : "–";
+
+        document.getElementById("car_charging_status").textContent =
+        data.car_charging_status != null ? data.car_charging_status : "–";
+
+        document.getElementById("car_status_timestamp").textContent =
+        data.car_status_timestamp != null ? data.car_status_timestamp : "–";
+
 
         // PV, Grid, WB, P_available_now
         const pvElem = document.getElementById("pv_kw");
