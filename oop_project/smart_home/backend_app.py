@@ -229,6 +229,7 @@ class AppState:
                         self.status["grid_kw_avg"] = grid_avg_kw
                         self.status["wb_kw_avg"] = wb_kw_avg
                         self.status["p_available_kw"] = result["p_available_kw"]
+                        self.just_switched_to_pv = False   # Moduswechsel-Trigger zurücksetzen
 
                     # Entscheidung an die Wallbox übergeben
                     self.apply_charger_decision(
