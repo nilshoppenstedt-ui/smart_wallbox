@@ -63,6 +63,9 @@ class AppState:
         self.grid_samples: list[float] = []
         self.counter: int = 0
 
+        # Flag: gerade von monitor_only → pv_surplus gewechselt
+        self.just_switched_to_pv = False
+
         # Gemeinsamer Status
         self.status = {
             "timestamp": None,
@@ -91,8 +94,15 @@ class AppState:
     def set_mode(self, mode: str) -> None:
         if mode not in ("pv_surplus", "monitor_only"):
             raise ValueError(f"Unsupported mode: {mode}")
+
         with self.lock:
+            old_mode = self.status.get("mode", "pv_surplus")
             self.status["mode"] = mode
+
+            # Wenn von monitor_only → pv_surplus gewechselt wird:
+            if old_mode == "monitor_only" and mode == "pv_surplus":
+                # Flag setzen: beim nächsten Loop-Durchlauf sofort regeln
+                self.just_switched_to_pv = True
 
     # ------------------------------------------------------------------
     # Live-Snapshot (wird jede Sekunde aufgerufen)
@@ -185,12 +195,19 @@ class AppState:
                 # Modus abfragen
                 mode = self.get_mode()
 
-                # Alle 5 min: Controller ausführen (nur im pv_surplus-Modus)
-                if (
+                # Flag für Modus-Wechsel lokal abfragen (unter Lock)
+                with self.lock:
+                    just_switched = self.just_switched_to_pv
+
+                # Bedingung: entweder normales 5-Minuten-Ende ODER frischer Moduswechsel
+                trigger_control = (
                     mode == "pv_surplus"
                     and self.grid_samples
-                    and (self.counter == CONTROL_PERIOD_SEC - 1)
-                ):
+                    and (self.counter == CONTROL_PERIOD_SEC - 1 or just_switched)
+                )
+
+                # Alle 5 min: Controller ausführen (nur im pv_surplus-Modus)
+                if trigger_control:
                     grid_avg_kw = sum(self.grid_samples) / len(self.grid_samples)
 
                     try:

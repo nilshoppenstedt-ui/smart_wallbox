@@ -1,6 +1,6 @@
 flask
 goecharger_api_lite
 pymodbus
-aiohttp
+aiohttp<3.9
 requests
 pytest
