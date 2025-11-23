@@ -442,12 +442,20 @@ HTML_PAGE = """
     <title>PV & Wallbox Monitor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
+        /* Standard: Scrollen auf mobilen Geräten erlauben */
         html, body {
             margin: 0;
             padding: 0;
-            overflow-y: hidden;   /* vertikale Scrollbar unterdrücken */
-            overflow-x: hidden;   /* horizontale Scrollbar ebenfalls */
-            height: 100%;         /* wichtig, verhindert Überhang */
+            overflow-y: auto;     /* Handy kann scrollen */
+            overflow-x: hidden;
+            height: 100%;
+        }
+
+        /* Für den Raspberry-Pi-Kiosk (Landscape, geringe Höhe) Scrollen deaktivieren */
+        @media (min-width: 700px) and (max-height: 450px) {
+            html, body {
+                overflow-y: hidden;   /* Kein Scrollen auf dem Kiosk */
+            }
         }
 
         body {
