@@ -451,12 +451,24 @@ HTML_PAGE = """
             height: 100%;
         }
 
-        /* Für den Raspberry-Pi-Kiosk (Landscape, geringe Höhe) Scrollen deaktivieren */
-        @media (min-width: 700px) and (max-height: 450px) {
+        /* Kiosk-Modus für das 5"-Display (Landscape, geringe Höhe) */
+        @media (min-width: 700px) and (max-height: 600px) {
             html, body {
                 overflow-y: hidden;   /* Kein Scrollen auf dem Kiosk */
             }
+
+            /* Grid auf 4 Spalten festsetzen → 2 Zeilen (4 + 3 Kacheln) */
+            .cards {
+                grid-template-columns: repeat(4, 1fr);
+                gap: 0.75rem;         /* Optional: etwas kompakter */
+            }
+
+            /* Optional: etwas weniger Padding, um Höhe zu sparen */
+            main {
+                padding: 0.75rem;
+            }
         }
+
 
         body {
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
