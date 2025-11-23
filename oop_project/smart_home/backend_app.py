@@ -638,9 +638,7 @@ HTML_PAGE = """
         </div>
     </div>
 </main>
-<footer>
-    Datenquelle: Stromzähler, Wechselrichter, go-e Wallbox · Aktualisierung alle 2&nbsp;Sekunden
-</footer>
+
 
 <script>
     function formatKw(value) {
