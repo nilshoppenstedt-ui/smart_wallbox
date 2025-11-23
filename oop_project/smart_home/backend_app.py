@@ -538,15 +538,18 @@ HTML_PAGE = """
         .car-state span {
             font-weight: 600;
         }
+
+        /* große Buttons für die Modus-Kachel */
         .mode-btn {
             background: #111827;
             border: 1px solid #4b5563;
             color: #e5e7eb;
-            padding: 0.2rem 0.6rem;
+            padding: 0.75rem 1rem;
             border-radius: 999px;
-            font-size: 0.75rem;
+            font-size: 0.95rem;
             cursor: pointer;
-            margin-left: 0.25rem;
+            width: 100%;
+            text-align: center;
         }
         .mode-btn.active {
             background: #2563eb;
@@ -555,6 +558,18 @@ HTML_PAGE = """
         .mode-btn:active {
             transform: scale(0.97);
         }
+
+        /* Layout für die Modus-Kachel */
+        .card-mode .mode-card-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-top: 0.75rem;
+        }
+        .card-mode .mode-indicator-row {
+            margin-top: 0.25rem;
+        }
+
         footer {
             padding: 0.5rem 1.5rem;
             font-size: 0.75rem;
@@ -579,21 +594,7 @@ HTML_PAGE = """
             Fahrzeug: <span id="car_state">–</span>
         </div>
     </div>
-    <div style="text-align: right;">
-        <div class="mode-pill mode-pv" id="mode_indicator">
-            <span class="dot"></span>
-            <span id="mode_text">PV-Überschuss</span>
-        </div>
-        <div style="margin-top: 0.3rem;">
-            <button class="mode-btn" id="btn_pv" onclick="setMode('pv_surplus')">
-                PV-Überschuss
-            </button>
-            <button class="mode-btn" id="btn_monitor" onclick="setMode('monitor_only')">
-                Nur Anzeige
-            </button>
-        </div>
-        <div class="timestamp" id="timestamp">–</div>
-    </div>
+    <div class="timestamp" id="timestamp">–</div>
 </header>
 <main>
     <div class="cards">
@@ -642,6 +643,26 @@ HTML_PAGE = """
                 Stand: <span id="car_status_timestamp">–</span>
             </div>
         </div>
+
+        <!-- neue Kachel für den Betriebsmodus -->
+        <div class="card card-mode">
+            <h2>Betriebsmodus</h2>
+            <div class="mode-indicator-row">
+                <div class="mode-pill mode-pv" id="mode_indicator">
+                    <span class="dot"></span>
+                    <span id="mode_text">PV-Überschuss</span>
+                </div>
+            </div>
+            <div class="mode-card-body">
+                <button class="mode-btn" id="btn_pv" onclick="setMode('pv_surplus')">
+                    PV-Überschuss
+                </button>
+                <button class="mode-btn" id="btn_monitor" onclick="setMode('monitor_only')">
+                    Nur Anzeige
+                </button>
+            </div>
+        </div>
+
     </div>
 </main>
 
@@ -698,27 +719,27 @@ HTML_PAGE = """
 
         // Fahrzeugstatus
         if (data.car_soc != null) {
-        document.getElementById("car_soc").textContent = data.car_soc.toFixed
-            ? data.car_soc.toFixed(0)
-            : data.car_soc;
+            document.getElementById("car_soc").textContent = data.car_soc.toFixed
+                ? data.car_soc.toFixed(0)
+                : data.car_soc;
         } else {
-        document.getElementById("car_soc").textContent = "–";
+            document.getElementById("car_soc").textContent = "–";
         }
 
         if (data.car_autonomy_km != null) {
-        document.getElementById("car_autonomy").textContent = data.car_autonomy_km;
+            document.getElementById("car_autonomy").textContent = data.car_autonomy_km;
         } else {
-        document.getElementById("car_autonomy").textContent = "–";
+            document.getElementById("car_autonomy").textContent = "–";
         }
 
         document.getElementById("car_plug_status").textContent =
-        data.car_plug_status != null ? data.car_plug_status : "–";
+            data.car_plug_status != null ? data.car_plug_status : "–";
 
         document.getElementById("car_charging_status").textContent =
-        data.car_charging_status != null ? data.car_charging_status : "–";
+            data.car_charging_status != null ? data.car_charging_status : "–";
 
         document.getElementById("car_status_timestamp").textContent =
-        data.car_status_timestamp != null ? data.car_status_timestamp : "–";
+            data.car_status_timestamp != null ? data.car_status_timestamp : "–";
 
 
         // PV, Grid, WB, P_available_now
@@ -789,6 +810,7 @@ HTML_PAGE = """
 </body>
 </html>
 """
+
 
 
 @app.route("/", methods=["GET"])
