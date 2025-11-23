@@ -5,7 +5,8 @@ import asyncio
 
 from flask import Flask, jsonify, Response, request
 
-from goecharger_api_lite import GoeCharger
+#from goecharger_api_lite import GoeCharger
+from .simple_goe_client import SimpleGoEClient, SimpleGoEClientError
 
 from .grid_meter import GridMeter, GridMeterError
 from .pv_inverter import PVInverter, PVInverterError
@@ -61,7 +62,12 @@ class AppState:
         self.pv_inv     = PVInverter(PV_IP, port=PV_PORT, unit_id=PV_UNIT)
         self.wb         = Wallbox(WB_IP)
         self.controller = SurplusController(ControllerParams())
-        self.charger    = GoeCharger(WB_IP)
+        # self.charger    = GoeCharger(WB_IP)
+        try:
+            self.charger = SimpleGoEClient(WB_IP)
+        except SimpleGoEClientError as e:
+            print(f"[Warn] Could not initialize SimpleGoEClient: {e}")
+            self.charger = None
 
         # CarClient (Renault)
         self.car_client = None
@@ -150,6 +156,7 @@ class AppState:
             wb_kw = self.wb.read_power_kw()
         except WallboxError as e:
             print(f"[Debug] WB read error: {e}")
+            wb_kw = None
 
         # Live p_available_now berechnen
         p_available_now = None
@@ -166,17 +173,19 @@ class AppState:
         phase_live = None
         current_live = None
         car_state = None
-        try:
-            status_min = self.charger.get_status(status_type=self.charger.STATUS_MINIMUM)
-            car_state = status_min.get("car_state")
 
-            phase_status = self.charger.get_phase_mode()
-            phase_live = 1 if phase_status["phase_mode"] == "one" else 3
-
-            amp_status = self.charger.get_ampere()
-            current_live = amp_status["ampere_allowed"]
-        except Exception as e:
-            print(f"[Debug] Charger phase/amp error: {e}")
+        if self.charger is not None:
+            try:
+                # minimale, normalisierte Sicht auf den Status holen
+                st = self.charger.get_status_min()
+                car_state = st.car_state
+                phase_live = st.phase_mode      # 1 oder 3
+                current_live = st.ampere_allowed
+            except SimpleGoEClientError as e:
+                print(f"[Debug] Charger status error: {e}")
+        else:
+            # z.B. auf dem Pi, falls SimpleGoEClient nicht initialisiert werden konnte
+            print("[Debug] Charger object is None – no live phase/current read")
 
         # Status aktualisieren
         with self.lock:
@@ -300,18 +309,23 @@ class AppState:
     # Entscheidung an die go-e-Charger-API weitergeben
     # ------------------------------------------------------------------
     def apply_charger_decision(self, phase_new: int, current_new: int) -> None:
-        setValues = self.charger.SettableValueEnum()
+        """
+        Wendet die vom Controller berechneten Einstellungen (Phase, Strom)
+        auf die go-e Wallbox an (HTTP-API via SimpleGoEClient).
+        """
 
+        # Falls kein Charger verfügbar ist (z.B. auf einem System ohne Steuerung)
+        if self.charger is None:
+            print("[Warn] No charger client available – skipping apply_charger_decision.")
+            return
+
+        # Aktuellen Zustand lesen
         try:
-            status_min = self.charger.get_status(status_type=self.charger.STATUS_MINIMUM)
-            car_state = status_min.get("car_state", "unknown")
-
-            phase_status = self.charger.get_phase_mode()
-            phase_current = 1 if phase_status["phase_mode"] == "one" else 3
-
-            amp_status = self.charger.get_ampere()
-            current_current = amp_status["ampere_allowed"]
-        except Exception as e:
+            st = self.charger.get_status_min()
+            car_state = st.car_state or "unknown"
+            phase_current = st.phase_mode          # 1 oder 3 (oder None)
+            current_current = st.ampere_allowed    # int oder None
+        except SimpleGoEClientError as e:
             print(f"[Warn] Error reading charger state: {e}")
             return
 
@@ -321,38 +335,62 @@ class AppState:
             f"phase_new={phase_new}, current_new={current_new}"
         )
 
-        # 1) Ausgeschaltet lassen
+        # Keine sinnvollen Istwerte gefunden → lieber nichts tun
+        if phase_current is None or current_current is None:
+            print("[Warn] Incomplete charger status (phase/current None) – skipping control action.")
+            return
+
+        # 1) Ausgeschaltet lassen (keine Ladung, kein neuer Strom)
         if car_state != "Charging" and current_new == 0:
             return
 
         # 2) Ladung stoppen
         if car_state == "Charging" and current_new == 0:
-            self.charger.set_charging_mode(setValues.ChargingMode.off)
+            try:
+                # hart stoppen
+                self.charger.set_charging_mode(False)  # → /api/set?frc=1
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error stopping charge: {e}")
             return
 
         # 3) Ladung starten
         if car_state not in ("Idle", "Charging") and current_new > 0:
-            if phase_new == 1:
-                self.charger.set_phase_mode(setValues.PhaseMode.one)
-            else:
-                self.charger.set_phase_mode(setValues.PhaseMode.three)
-            self.charger.set_ampere(current_new)
-            self.charger.set_charging_mode(setValues.ChargingMode.on)
+            try:
+                # Phase einstellen
+                if phase_new == 1:
+                    self.charger.set_phase_mode(1)    # → /api/set?psm=1
+                else:
+                    self.charger.set_phase_mode(3)    # → /api/set?psm=2
+
+                # Strom einstellen
+                self.charger.set_ampere(current_new)  # → /api/set?amp=...
+
+                # Freigeben
+                self.charger.set_charging_mode(True)  # → /api/set?frc=0
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error starting charge: {e}")
             return
 
         # 4) Ladung läuft, Parameter anpassen
         if car_state == "Charging" and current_new > 0:
-            # Phasenwechsel 1 -> 3
-            if phase_current == 1 and phase_new == 3:
-                self.charger.set_phase_mode(setValues.PhaseMode.three)
-                self.charger.set_ampere(current_new)
-            # Phasenwechsel 3 -> 1
-            elif phase_current == 3 and phase_new == 1:
-                self.charger.set_phase_mode(setValues.PhaseMode.one)
-                self.charger.set_ampere(current_new)
-            # Phase gleich, nur Strom anpassen
-            else:
-                self.charger.set_ampere(current_new)
+            try:
+                # Phasenwechsel 1 -> 3
+                if phase_current == 1 and phase_new == 3:
+                    self.charger.set_phase_mode(3)
+                    self.charger.set_ampere(current_new)
+
+                # Phasenwechsel 3 -> 1
+                elif phase_current == 3 and phase_new == 1:
+                    self.charger.set_phase_mode(1)
+                    self.charger.set_ampere(current_new)
+
+                # Phase gleich, nur Strom anpassen
+                else:
+                    self.charger.set_ampere(current_new)
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error adjusting charge parameters: {e}")
+
+
 
 
 # ---------------------------------------------------------------------------
