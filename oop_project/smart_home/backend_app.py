@@ -442,10 +442,16 @@ HTML_PAGE = """
     <title>PV & Wallbox Monitor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body {
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        html, body {
             margin: 0;
             padding: 0;
+            overflow-y: hidden;   /* vertikale Scrollbar unterdrücken */
+            overflow-x: hidden;   /* horizontale Scrollbar ebenfalls */
+            height: 100%;         /* wichtig, verhindert Überhang */
+        }
+
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             background: #111827;
             color: #e5e7eb;
             display: flex;
