@@ -1,7 +1,7 @@
 flask
 #goecharger_api_lite
 pymodbus
-aiohttp<3.9
+#aiohttp<3.9
 requests
 pytest
 renault-api
