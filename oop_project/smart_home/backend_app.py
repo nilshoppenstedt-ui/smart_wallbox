@@ -87,6 +87,9 @@ class AppState:
         self.status = {
             "timestamp": None,
             "pv_kw": None,
+            "pv1_kw": None,
+            "pv2_kw": None,
+            "pv3_kw": None,
             "grid_kw": None,
             "wb_kw": None,
             "grid_kw_avg": None,
@@ -136,12 +139,19 @@ class AppState:
         Lies PV, Grid, WB sowie Phase/Strom der Wallbox und aktualisiere status.
         """
         pv_kw = None
+        pv1_kw = None
+        pv2_kw = None
+        pv3_kw = None
         grid_kw = None
         wb_kw = None
 
         # PV
         try:
             pv_kw = self.pv_inv.read_total_power_kw()
+            string_powers = self.pv_inv.read_string_powers_kw()
+            pv1_kw = string_powers.get("pv1_kw")
+            pv2_kw = string_powers.get("pv2_kw")
+            pv3_kw = string_powers.get("pv3_kw")
         except PVInverterError as e:
             print(f"[Debug] PV read error: {e}")
 
@@ -191,6 +201,9 @@ class AppState:
         with self.lock:
             self.status["timestamp"] = datetime.now().isoformat(timespec="seconds")
             self.status["pv_kw"] = pv_kw
+            self.status["pv1_kw"] = pv1_kw
+            self.status["pv2_kw"] = pv2_kw
+            self.status["pv3_kw"] = pv3_kw
             self.status["grid_kw"] = grid_kw
             self.status["wb_kw"] = wb_kw
             self.status["car_state"] = car_state
@@ -622,6 +635,7 @@ HTML_PAGE = """
             <h2>PV-Leistung</h2>
             <div class="value" id="pv_kw">– kW</div>
             <div class="label">Aktuelle PV-Leistung</div>
+            <div class="label" id="pv_strings">–</div>
         </div>
         <div class="card">
             <h2>Netzleistung</h2>
@@ -767,11 +781,36 @@ HTML_PAGE = """
         const gridElem = document.getElementById("grid_kw");
         const wbElem = document.getElementById("wb_kw");
         const pavElem = document.getElementById("p_available_kw");
+        const pvStringsElem = document.getElementById("pv_strings");
 
         pvElem.textContent = formatKw(data.pv_kw);
         gridElem.textContent = formatKw(data.grid_kw);
         wbElem.textContent = formatKw(data.wb_kw);
         pavElem.textContent = formatKw(data.p_available_now);
+
+         // PV strings: short summary "1.2 / 0.3 / 1.5"
+        if (pvStringsElem) {
+            const v1 = data.pv1_kw;
+            const v2 = data.pv2_kw;
+            const v3 = data.pv3_kw;
+
+            function fmtStringKw(val) {
+                if (val === null || val === undefined || typeof val !== "number" || isNaN(val)) {
+                    return "-";
+                }
+                return val.toFixed(1);
+            }
+
+            const s1 = fmtStringKw(v1);
+            const s2 = fmtStringKw(v2);
+            const s3 = fmtStringKw(v3);
+
+            if (s1 === "-" && s2 === "-" && s3 === "-") {
+                pvStringsElem.textContent = "–";
+            } else {
+                pvStringsElem.textContent = `${s1} / ${s2} / ${s3}`;
+            }
+        }
 
         // Grid color coding
         gridElem.classList.remove("grid-positive", "grid-negative");
