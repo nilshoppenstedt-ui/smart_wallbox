@@ -798,7 +798,7 @@ HTML_PAGE = """
                 if (val === null || val === undefined || typeof val !== "number" || isNaN(val)) {
                     return "-";
                 }
-                return val.toFixed(1);
+                return val.toFixed(2);
             }
 
             const s1 = fmtStringKw(v1);
