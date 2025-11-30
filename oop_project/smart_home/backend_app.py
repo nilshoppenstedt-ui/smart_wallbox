@@ -33,6 +33,10 @@ CONTROL_PERIOD_SEC  = 180
 MAX_GRID_SAMPLES    = CONTROL_PERIOD_SEC // GRID_SAMPLE_EVERY 
 CAR_STATUS_PERIOD_SEC = 180  
 
+# Battery saving: stop charging when SoC is high and data is fresh
+BATTERY_SAVING_SOC_LIMIT = 90.0      # [%] threshold for battery-saving stop
+BATTERY_SAVING_MAX_AGE_SEC = 600     # [s] max age of car status for SoC-based stop
+BATTERY_SAVING_CHECK_PERIOD = 180
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +104,7 @@ class AppState:
             "current": None,            # Live-Strom der WB
             "mode": "pv_surplus",       # oder "monitor_only"
             "car_state": None,
+            "soc_protection": True,     # stoppe Ladung, wenn SoC ausreichend hoch
 
             # Fahrzeugstatus (Renault)
             "car_soc": None,
@@ -107,6 +112,8 @@ class AppState:
             "car_plug_status": None,
             "car_charging_status": None,
             "car_status_timestamp": None,
+            "car_status_valid": False,
+            "car_status_last_attempt": None,
         }
 
         self.lock = threading.Lock()
@@ -227,15 +234,66 @@ class AppState:
             print(f"[Warn] Car status read error: {e}")
             # nur Zeitstempel aktualisieren, damit man sieht, dass es versucht wurde
             with self.lock:
-                self.status["car_status_timestamp"] = datetime.now().isoformat(timespec="seconds")
+                self.status["car_status_valid"] = False
+                self.status["car_status_last_attempt"] = datetime.now().isoformat(timespec="seconds")
             return
 
         with self.lock:
-            self.status["car_soc"]             = car_status.soc
-            self.status["car_autonomy_km"]     = car_status.autonomy_km
-            self.status["car_plug_status"]     = car_status.plug_status
-            self.status["car_charging_status"] = car_status.charging_status
-            self.status["car_status_timestamp"] = car_status.timestamp.isoformat(timespec="seconds")
+            self.status["car_soc"]                  = car_status.soc
+            self.status["car_autonomy_km"]          = car_status.autonomy_km
+            self.status["car_plug_status"]          = car_status.plug_status
+            self.status["car_charging_status"]      = car_status.charging_status
+            self.status["car_status_timestamp"]     = car_status.timestamp.isoformat(timespec="seconds")
+            self.status["car_status_valid"]         = True
+            self.status["car_status_last_attempt"]  = car_status.timestamp.isoformat(timespec="seconds")
+
+
+    def check_battery_saving_stop(self) -> tuple[bool, float | None]:
+        """Return (battery_saving_stop, soc_value).
+
+        battery_saving_stop ist nur dann True, wenn:
+        - car_status_valid == True
+        - car_soc in [0, 100]
+        - car_status_timestamp existiert und jünger als BATTERY_SAVING_MAX_AGE_SEC ist
+        - car_soc >= BATTERY_SAVING_SOC_LIMIT
+
+        Bei Fehlern oder fehlenden/alten Daten immer (False, None).
+        """
+        battery_saving_stop = False
+        soc_value = None
+        try:
+            with self.lock:
+                soc_value = self.status.get("car_soc")
+                ts_str = self.status.get("car_status_timestamp")
+                valid = self.status.get("car_status_valid", False)
+
+            if valid and soc_value is not None and isinstance(soc_value, (int, float)):
+                ts = None
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                    except Exception:
+                        ts = None
+
+                if ts is not None:
+                    if ts.tzinfo is not None:
+                        now = datetime.now(ts.tzinfo)
+                    else:
+                        now = datetime.now()
+                    age_sec = (now - ts).total_seconds()
+
+                    if (
+                        0.0 <= soc_value <= 100.0 and
+                        0.0 <= age_sec <= BATTERY_SAVING_MAX_AGE_SEC and
+                        soc_value >= BATTERY_SAVING_SOC_LIMIT
+                    ):
+                        battery_saving_stop = True
+
+        except Exception as e:
+            print(f"[Debug] battery_saving_stop evaluation error: {e}")
+            battery_saving_stop = False
+
+        return battery_saving_stop, soc_value
 
 
     # ------------------------------------------------------------------
@@ -244,10 +302,10 @@ class AppState:
     def run_loop(self):
         while True:
             try:
-                # Live-Daten für Anzeige
+                # Live snapshot for dashboard
                 self.update_instant_snapshot()
 
-                # Grid-Samples für Mittelung sammeln
+                # Collect grid samples for averaging
                 if self.counter % GRID_SAMPLE_EVERY == 0:
                     try:
                         g = self.grid_meter.read_power_kw()
@@ -258,25 +316,43 @@ class AppState:
                     if len(self.grid_samples) > MAX_GRID_SAMPLES:
                         self.grid_samples = self.grid_samples[-MAX_GRID_SAMPLES:]
 
-                # Fahrzeugstatus alle CAR_STATUS_PERIOD_SEC Sekunden aktualisieren
+                # Update car status periodically (Renault API)
                 if self.counter % CAR_STATUS_PERIOD_SEC == 0:
                     self.update_car_status()
 
-                # Modus abfragen
+                # Query mode
                 mode = self.get_mode()
 
-                # Flag für Modus-Wechsel lokal abfragen (unter Lock)
+                # Check flag for fresh mode switch (under lock)
                 with self.lock:
                     just_switched = self.just_switched_to_pv
+                    soc_protection = self.status.get("soc_protection", True)
+                    current_phase = self.status.get("phase")
 
-                # Bedingung: entweder normales 5-Minuten-Ende ODER frischer Moduswechsel
+                # Condition for PV surplus controller activation
                 trigger_control = (
                     mode == "pv_surplus"
                     and self.grid_samples
                     and (self.counter == CONTROL_PERIOD_SEC - 1 or just_switched)
                 )
 
-                # Alle 5 min: Controller ausführen (nur im pv_surplus-Modus)
+                # Condition for SoC-check in monitor_only mode
+                soc_control = (
+                    soc_protection
+                    and mode == "monitor_only"
+                    and (self.counter % BATTERY_SAVING_CHECK_PERIOD == 0)
+                )
+
+                # Unified SoC-check (only once per loop)
+                battery_saving_stop = False
+                soc_value = None
+
+                if soc_protection and (trigger_control or soc_control):
+                    battery_saving_stop, soc_value = self.check_battery_saving_stop()
+
+                # ----------------------------------------------------------
+                # PV Surplus Controller
+                # ----------------------------------------------------------
                 if trigger_control:
                     grid_avg_kw = sum(self.grid_samples) / len(self.grid_samples)
 
@@ -288,6 +364,14 @@ class AppState:
 
                     result = self.controller.step(grid_kw=grid_avg_kw, wb_kw=wb_kw_avg)
 
+                    # Apply battery saving inside surplus mode
+                    if battery_saving_stop:
+                        print(
+                            f"[Control] Battery-saving stop active "
+                            f"(SoC={soc_value:.1f} %) – forcing current to 0 A."
+                        )
+                        result["current"] = 0
+
                     print(
                         f"[5min] Grid_avg: {grid_avg_kw:6.2f} kW | "
                         f"WB_avg: {wb_kw_avg:6.2f} kW | "
@@ -295,22 +379,43 @@ class AppState:
                         f"phase={result['phase']} | current={result['current']} A"
                     )
 
+                    # Update status
                     with self.lock:
                         self.status["grid_kw_avg"] = grid_avg_kw
                         self.status["wb_kw_avg"] = wb_kw_avg
                         self.status["p_available_kw"] = result["p_available_kw"]
-                        self.just_switched_to_pv = False   # Moduswechsel-Trigger zurücksetzen
+                        self.just_switched_to_pv = False
 
-                    # Entscheidung an die Wallbox übergeben
+                    # Apply decision to wallbox
                     self.apply_charger_decision(
                         phase_new=result["phase"],
                         current_new=result["current"]
                     )
 
-                    # Fenster zurücksetzen
+                    # Reset averaging buffer
                     self.grid_samples = []
 
-                # Sekunden-Zähler
+                # ----------------------------------------------------------
+                # SoC-schutz im Monitor-Only-Modus (keine PV-Regelung)
+                # ----------------------------------------------------------
+                if soc_control and battery_saving_stop:
+                    print(
+                        f"[Control] Battery-saving stop (monitor_only, "
+                        f"SoC={soc_value:.1f} %) – forcing current to 0 A."
+                    )
+
+                    # Phase fallback: use current phase if known
+                    if isinstance(current_phase, int) and current_phase in (1, 3):
+                        phase_new = current_phase
+                    else:
+                        phase_new = 1
+
+                    self.apply_charger_decision(
+                        phase_new=phase_new,
+                        current_new=0
+                    )
+
+                # Loop counter (in ticks)
                 self.counter = (self.counter + 1) % CONTROL_PERIOD_SEC
 
             except Exception as e:
@@ -318,90 +423,6 @@ class AppState:
 
             time.sleep(SAMPLE_INTERVAL_SEC)
 
-    # ------------------------------------------------------------------
-    # Entscheidung an die go-e-Charger-API weitergeben
-    # ------------------------------------------------------------------
-    def apply_charger_decision(self, phase_new: int, current_new: int) -> None:
-        """
-        Wendet die vom Controller berechneten Einstellungen (Phase, Strom)
-        auf die go-e Wallbox an (HTTP-API via SimpleGoEClient).
-        """
-
-        # Falls kein Charger verfügbar ist (z.B. auf einem System ohne Steuerung)
-        if self.charger is None:
-            print("[Warn] No charger client available – skipping apply_charger_decision.")
-            return
-
-        # Aktuellen Zustand lesen
-        try:
-            st = self.charger.get_status_min()
-            car_state = st.car_state or "unknown"
-            phase_current = st.phase_mode          # 1 oder 3 (oder None)
-            current_current = st.ampere_allowed    # int oder None
-        except SimpleGoEClientError as e:
-            print(f"[Warn] Error reading charger state: {e}")
-            return
-
-        print(
-            f"[Control] car_state={car_state}, "
-            f"phase_current={phase_current}, current_current={current_current}, "
-            f"phase_new={phase_new}, current_new={current_new}"
-        )
-
-        # Keine sinnvollen Istwerte gefunden → lieber nichts tun
-        if phase_current is None or current_current is None:
-            print("[Warn] Incomplete charger status (phase/current None) – skipping control action.")
-            return
-
-        # 1) Ausgeschaltet lassen (keine Ladung, kein neuer Strom)
-        if car_state != "Charging" and current_new == 0:
-            return
-
-        # 2) Ladung stoppen
-        if car_state == "Charging" and current_new == 0:
-            try:
-                # hart stoppen
-                self.charger.set_charging_mode(False)  # → /api/set?frc=1
-            except SimpleGoEClientError as e:
-                print(f"[Warn] Error stopping charge: {e}")
-            return
-
-        # 3) Ladung starten
-        if car_state not in ("Idle", "Charging") and current_new > 0:
-            try:
-                # Phase einstellen
-                if phase_new == 1:
-                    self.charger.set_phase_mode(1)    # → /api/set?psm=1
-                else:
-                    self.charger.set_phase_mode(3)    # → /api/set?psm=2
-
-                # Strom einstellen
-                self.charger.set_ampere(current_new)  # → /api/set?amp=...
-
-                # Freigeben
-                self.charger.set_charging_mode(True)  # → /api/set?frc=0
-            except SimpleGoEClientError as e:
-                print(f"[Warn] Error starting charge: {e}")
-            return
-
-        # 4) Ladung läuft, Parameter anpassen
-        if car_state == "Charging" and current_new > 0:
-            try:
-                # Phasenwechsel 1 -> 3
-                if phase_current == 1 and phase_new == 3:
-                    self.charger.set_phase_mode(3)
-                    self.charger.set_ampere(current_new)
-
-                # Phasenwechsel 3 -> 1
-                elif phase_current == 3 and phase_new == 1:
-                    self.charger.set_phase_mode(1)
-                    self.charger.set_ampere(current_new)
-
-                # Phase gleich, nur Strom anpassen
-                else:
-                    self.charger.set_ampere(current_new)
-            except SimpleGoEClientError as e:
-                print(f"[Warn] Error adjusting charge parameters: {e}")
 
 
 
