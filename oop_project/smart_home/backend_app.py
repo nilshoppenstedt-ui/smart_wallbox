@@ -459,6 +459,24 @@ def api_mode():
     return jsonify({"status": "ok", "mode": mode})
 
 
+@app.route("/api/soc_protection", methods=["POST"])
+def api_soc_protection():
+    """Toggle or set SoC protection flag in AppState.status.
+
+    Expects JSON body: { "value": true/false }
+    """
+    data = request.get_json(silent=True) or {}
+    value = data.get("value", None)
+
+    if not isinstance(value, bool):
+        return jsonify({"error": "value must be a boolean"}), 400
+
+    with app_state.lock:
+        app_state.status["soc_protection"] = value
+
+    return jsonify({"status": "ok", "soc_protection": value})
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -699,21 +717,18 @@ HTML_PAGE = """
             </div>
         </div>
 
-        <!-- neue Kachel für den Betriebsmodus -->
+        <!-- Kachel für den Betriebsmodus -->
         <div class="card card-mode">
             <h2>Betriebsmodus</h2>
-            <div class="mode-indicator-row">
-                <div class="mode-pill mode-pv" id="mode_indicator">
-                    <span class="dot"></span>
-                    <span id="mode_text">PV-Überschuss</span>
-                </div>
-            </div>
             <div class="mode-card-body">
                 <button class="mode-btn" id="btn_pv" onclick="setMode('pv_surplus')">
                     PV-Überschuss
                 </button>
                 <button class="mode-btn" id="btn_monitor" onclick="setMode('monitor_only')">
                     Nur Anzeige
+                </button>
+                <button class="mode-btn" id="btn_soc" onclick="toggleSocProtection()">
+                    SoC-Schutz: –
                 </button>
             </div>
         </div>
@@ -730,43 +745,51 @@ HTML_PAGE = """
         return value.toFixed(2) + " kW";
     }
 
+    // Track current SoC protection state in frontend
+    let socProtection = true;
+
     function updateDashboard(data) {
         // Timestamp
         const tsElem = document.getElementById("timestamp");
         tsElem.textContent = data.timestamp || "–";
 
-        // Mode
+        // Mode buttons
         const mode = data.mode || "unknown";
-        const modeTextElem = document.getElementById("mode_text");
-        const modeIndicator = document.getElementById("mode_indicator");
         const btnPv = document.getElementById("btn_pv");
         const btnMonitor = document.getElementById("btn_monitor");
+        const btnSoc = document.getElementById("btn_soc");
 
         if (mode === "pv_surplus") {
-            modeTextElem.textContent = "PV-Überschuss";
-            modeIndicator.classList.add("mode-pv");
-            modeIndicator.classList.remove("mode-off");
             if (btnPv && btnMonitor) {
                 btnPv.classList.add("active");
                 btnMonitor.classList.remove("active");
             }
         } else if (mode === "monitor_only") {
-            modeTextElem.textContent = "Nur Anzeige";
-            modeIndicator.classList.remove("mode-pv");
-            modeIndicator.classList.add("mode-off");
             if (btnPv && btnMonitor) {
                 btnPv.classList.remove("active");
                 btnMonitor.classList.add("active");
             }
         } else {
-            modeTextElem.textContent = "Modus: " + mode;
-            modeIndicator.classList.remove("mode-pv");
-            modeIndicator.classList.add("mode-off");
             if (btnPv && btnMonitor) {
                 btnPv.classList.remove("active");
                 btnMonitor.classList.remove("active");
             }
         }
+
+        // SoC protection button (text + highlighting)
+        if (typeof data.soc_protection === "boolean") {
+            socProtection = data.soc_protection;
+        }
+        if (btnSoc) {
+            if (socProtection) {
+                btnSoc.textContent = "SoC-Schutz: aktiv";
+                btnSoc.classList.add("active");
+            } else {
+                btnSoc.textContent = "SoC-Schutz: inaktiv";
+                btnSoc.classList.remove("active");
+            }
+        }
+
 
         // Car state
         const carStateElem = document.getElementById("car_state");
@@ -882,6 +905,32 @@ HTML_PAGE = """
             console.error("Fehler beim Setzen des Modus:", err);
         }
     }
+
+    async function toggleSocProtection() {
+        // Locally toggle and send desired new state to backend
+        const newValue = !socProtection;
+        try {
+            const response = await fetch("/api/soc_protection", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ value: newValue })
+            });
+            if (!response.ok) {
+                console.error("Fehler beim Setzen von soc_protection:", response.status);
+                return;
+            }
+            const data = await response.json();
+            // Backend is authoritative: use returned value
+            if (typeof data.soc_protection === "boolean") {
+                socProtection = data.soc_protection;
+            }
+            // Refresh UI from backend state
+            fetchStatus();
+        } catch (err) {
+            console.error("Fehler beim Setzen von soc_protection:", err);
+        }
+    }
+
 
     // Initial fetch and periodic polling
     fetchStatus();
