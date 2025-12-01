@@ -444,6 +444,92 @@ class AppState:
             time.sleep(SAMPLE_INTERVAL_SEC)
 
 
+    # ------------------------------------------------------------------
+    # Entscheidung an die go-e-Charger-API weitergeben
+    # ------------------------------------------------------------------
+    def apply_charger_decision(self, phase_new: int, current_new: int) -> None:
+        """
+        Wendet die vom Controller berechneten Einstellungen (Phase, Strom)
+        auf die go-e Wallbox an (HTTP-API via SimpleGoEClient).
+        """
+
+        # Falls kein Charger verfügbar ist (z.B. auf einem System ohne Steuerung)
+        if self.charger is None:
+            print("[Warn] No charger client available – skipping apply_charger_decision.")
+            return
+
+        # Aktuellen Zustand lesen
+        try:
+            st = self.charger.get_status_min()
+            car_state = st.car_state or "unknown"
+            phase_current = st.phase_mode          # 1 oder 3 (oder None)
+            current_current = st.ampere_allowed    # int oder None
+        except SimpleGoEClientError as e:
+            print(f"[Warn] Error reading charger state: {e}")
+            return
+
+        print(
+            f"[Control] car_state={car_state}, "
+            f"phase_current={phase_current}, current_current={current_current}, "
+            f"phase_new={phase_new}, current_new={current_new}"
+        )
+
+        # Keine sinnvollen Istwerte gefunden → lieber nichts tun
+        if phase_current is None or current_current is None:
+            print("[Warn] Incomplete charger status (phase/current None) – skipping control action.")
+            return
+
+        # 1) Ausgeschaltet lassen (keine Ladung, kein neuer Strom)
+        if car_state != "Charging" and current_new == 0:
+            return
+
+        # 2) Ladung stoppen
+        if car_state == "Charging" and current_new == 0:
+            try:
+                # hart stoppen
+                self.charger.set_charging_mode(False)  # → /api/set?frc=1
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error stopping charge: {e}")
+            return
+
+        # 3) Ladung starten
+        if car_state not in ("Idle", "Charging") and current_new > 0:
+            try:
+                # Phase einstellen
+                if phase_new == 1:
+                    self.charger.set_phase_mode(1)    # → /api/set?psm=1
+                else:
+                    self.charger.set_phase_mode(3)    # → /api/set?psm=2
+
+                # Strom einstellen
+                self.charger.set_ampere(current_new)  # → /api/set?amp=...
+
+                # Freigeben
+                self.charger.set_charging_mode(True)  # → /api/set?frc=0
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error starting charge: {e}")
+            return
+
+        # 4) Ladung läuft, Parameter anpassen
+        if car_state == "Charging" and current_new > 0:
+            try:
+                # Phasenwechsel 1 -> 3
+                if phase_current == 1 and phase_new == 3:
+                    self.charger.set_phase_mode(3)
+                    self.charger.set_ampere(current_new)
+
+                # Phasenwechsel 3 -> 1
+                elif phase_current == 3 and phase_new == 1:
+                    self.charger.set_phase_mode(1)
+                    self.charger.set_ampere(current_new)
+
+                # Phase gleich, nur Strom anpassen
+                else:
+                    self.charger.set_ampere(current_new)
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error adjusting charge parameters: {e}")
+
+
 
 # ---------------------------------------------------------------------------
 # Flask-App und Routen
