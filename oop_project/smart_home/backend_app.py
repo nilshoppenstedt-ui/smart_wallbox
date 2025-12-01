@@ -27,16 +27,17 @@ WB_IP   = "192.168.178.21"    # go-e wallbox
 PV_PORT = 1502
 PV_UNIT = 71
 
+# Time constants, unit = loop tics if not other stated
 SAMPLE_INTERVAL_SEC = 2
 GRID_SAMPLE_EVERY   = 1
-CONTROL_PERIOD      = 180
+CONTROL_PERIOD      = 90
 MAX_GRID_SAMPLES    = CONTROL_PERIOD // GRID_SAMPLE_EVERY 
-CAR_STATUS_PERIOD   = 180  
+CAR_STATUS_PERIOD   = 90  
 
 # Battery saving: stop charging when SoC is high and data is fresh
 BATTERY_SAVING_SOC_LIMIT    = 90.0      # [%] threshold for battery-saving stop
 BATTERY_SAVING_MAX_AGE_SEC  = 600       # [s] max age of car status for SoC-based stop
-BATTERY_SAVING_CHECK_PERIOD = 180
+BATTERY_SAVING_CHECK_PERIOD = 90        # Checking period for SoC-based stop in view-only mode
 
 
 # ---------------------------------------------------------------------------
