@@ -29,13 +29,13 @@ PV_UNIT = 71
 
 SAMPLE_INTERVAL_SEC = 2
 GRID_SAMPLE_EVERY   = 1
-CONTROL_PERIOD_SEC  = 180
-MAX_GRID_SAMPLES    = CONTROL_PERIOD_SEC // GRID_SAMPLE_EVERY 
-CAR_STATUS_PERIOD_SEC = 180  
+CONTROL_PERIOD      = 180
+MAX_GRID_SAMPLES    = CONTROL_PERIOD // GRID_SAMPLE_EVERY 
+CAR_STATUS_PERIOD   = 180  
 
 # Battery saving: stop charging when SoC is high and data is fresh
-BATTERY_SAVING_SOC_LIMIT = 90.0      # [%] threshold for battery-saving stop
-BATTERY_SAVING_MAX_AGE_SEC = 600     # [s] max age of car status for SoC-based stop
+BATTERY_SAVING_SOC_LIMIT    = 90.0      # [%] threshold for battery-saving stop
+BATTERY_SAVING_MAX_AGE_SEC  = 600       # [s] max age of car status for SoC-based stop
 BATTERY_SAVING_CHECK_PERIOD = 180
 
 
@@ -80,9 +80,14 @@ class AppState:
         except CarClientError as e:
             print(f"[Warn] CarClient not initialized: {e}")
 
-        # Zustand für Mittelung
+        # Zustand für Mittelung 
         self.grid_samples: list[float] = []
-        self.counter: int = 0
+
+        # Loop counters (loop ticks)
+        self.grid_counter: int       = 0      # for grid sampling
+        self.control_counter: int    = 0      # for PV-surplus control period
+        self.soc_counter: int        = 0      # for SoC protection checks
+        self.car_status_counter: int = 0      # for Renault car status polling
 
         # Flag: gerade von monitor_only → pv_surplus gewechselt
         self.just_switched_to_pv = False
@@ -222,7 +227,7 @@ class AppState:
     def update_car_status(self) -> None:
         """Fetch car battery status via CarClient and update status dict.
 
-        Wird im Hintergrundthread alle CAR_STATUS_PERIOD_SEC Sekunden aufgerufen.
+        Wird im Hintergrundthread alle CAR_STATUS_PERIOD Sekunden aufgerufen.
         """
         # Wenn kein CarClient existiert (z.B. keine Credentials): nichts tun
         if self.car_client is None:
@@ -305,8 +310,10 @@ class AppState:
                 # Live snapshot for dashboard
                 self.update_instant_snapshot()
 
-                # Collect grid samples for averaging
-                if self.counter % GRID_SAMPLE_EVERY == 0:
+                # ----------------------------------------------------------
+                # Grid samples for averaging (based on grid_counter)
+                # ----------------------------------------------------------
+                if self.grid_counter == 0:
                     try:
                         g = self.grid_meter.read_power_kw()
                         self.grid_samples.append(g)
@@ -316,8 +323,11 @@ class AppState:
                     if len(self.grid_samples) > MAX_GRID_SAMPLES:
                         self.grid_samples = self.grid_samples[-MAX_GRID_SAMPLES:]
 
+                # ----------------------------------------------------------
                 # Update car status periodically (Renault API)
-                if self.counter % CAR_STATUS_PERIOD_SEC == 0:
+                # based on car_status_counter
+                # ----------------------------------------------------------
+                if self.car_status_counter == 0:
                     self.update_car_status()
 
                 # Query mode
@@ -330,20 +340,24 @@ class AppState:
                     current_phase = self.status.get("phase")
 
                 # Condition for PV surplus controller activation
+                # CONTROL_PERIOD is interpreted as number of loop ticks
                 trigger_control = (
                     mode == "pv_surplus"
                     and self.grid_samples
-                    and (self.counter == CONTROL_PERIOD_SEC - 1 or just_switched)
+                    and (self.control_counter == CONTROL_PERIOD - 1 or just_switched)
                 )
 
                 # Condition for SoC-check in monitor_only mode
+                # BATTERY_SAVING_CHECK_PERIOD is in loop ticks, not seconds
                 soc_control = (
                     soc_protection
                     and mode == "monitor_only"
-                    and (self.counter % BATTERY_SAVING_CHECK_PERIOD == 0)
+                    and (self.soc_counter == 0)
                 )
 
-                # Unified SoC-check (only once per loop)
+                # ----------------------------------------------------------
+                # Unified SoC-check (only once per loop if relevant)
+                # ----------------------------------------------------------
                 battery_saving_stop = False
                 soc_value = None
 
@@ -396,7 +410,7 @@ class AppState:
                     self.grid_samples = []
 
                 # ----------------------------------------------------------
-                # SoC-schutz im Monitor-Only-Modus (keine PV-Regelung)
+                # SoC protection in monitor_only mode (no PV control)
                 # ----------------------------------------------------------
                 if soc_control and battery_saving_stop:
                     print(
@@ -415,15 +429,18 @@ class AppState:
                         current_new=0
                     )
 
-                # Loop counter (in ticks)
-                self.counter = (self.counter + 1) % CONTROL_PERIOD_SEC
+                # ----------------------------------------------------------
+                # Advance all loop counters (in ticks, not seconds)
+                # ----------------------------------------------------------
+                self.grid_counter = (self.grid_counter + 1) % GRID_SAMPLE_EVERY
+                self.control_counter = (self.control_counter + 1) % CONTROL_PERIOD
+                self.soc_counter = (self.soc_counter + 1) % BATTERY_SAVING_CHECK_PERIOD
+                self.car_status_counter = (self.car_status_counter + 1) % CAR_STATUS_PERIOD
 
             except Exception as e:
                 print(f"[Error] main loop: {e}")
 
             time.sleep(SAMPLE_INTERVAL_SEC)
-
-
 
 
 
