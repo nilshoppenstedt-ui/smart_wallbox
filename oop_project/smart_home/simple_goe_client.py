@@ -147,6 +147,36 @@ class SimpleGoEClient:
             ampere_allowed=ampere_allowed,
         )
 
+    def get_energy_since_connected_wh(self) -> Optional[float]:
+        """
+        Return energy in Wh since car connected (field 'wh').
+
+        Laut go-e-Doku:
+            'wh' = energie in Wh seit das aktuelle Fahrzeug verbunden ist.
+
+        Gibt:
+            - float-Wert in Wh, wenn verfügbar und parsbar
+            - None, wenn Feld fehlt oder nicht interpretiert werden kann
+
+        Zusätzlich werden Debug-Informationen auf der Konsole ausgegeben.
+        """
+        data = self.get_raw_status()
+        raw_wh = data.get("wh")
+
+        if raw_wh is None:
+            return None
+
+        try:
+            wh = float(raw_wh)
+        except Exception as e:
+            print(f"[Warn] Could not parse 'wh' value from wallbox: {raw_wh!r} ({e})")
+            return None
+
+        if wh < 0:
+            print(f"[Warn] Negative 'wh' from wallbox: {wh}")
+
+        return wh
+
     # -------------------------
     # Setters
     # -------------------------
@@ -194,3 +224,5 @@ class SimpleGoEClient:
         else:
             # Laden erzwingen AUS
             self._get_set({"frc": 1})
+
+

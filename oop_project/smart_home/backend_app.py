@@ -2,6 +2,7 @@ import threading
 import time
 from datetime import datetime
 import asyncio
+import traceback
 
 from flask import Flask, jsonify, Response, request
 
@@ -35,10 +36,13 @@ MAX_GRID_SAMPLES    = CONTROL_PERIOD // GRID_SAMPLE_EVERY
 CAR_STATUS_PERIOD   = 90  
 
 # Battery saving: stop charging when SoC is high and data is fresh
-BATTERY_SAVING_SOC_LIMIT    = 90.0      # [%] threshold for battery-saving stop
+BATTERY_SAVING_SOC_LIMIT    = 85.0      # [%] threshold for battery-saving stop
 BATTERY_SAVING_MAX_AGE_SEC  = 600       # [s] max age of car status for SoC-based stop
 BATTERY_SAVING_CHECK_PERIOD = 90        # Checking period for SoC-based stop in view-only mode
 
+# SoC estimation based on energy since connected
+BATTERY_CAPACITY_KWH  = 35   # usable battery capacity [kWh] – adjust to your measurement
+CHARGING_EFFICIENCY   = 0.90   # assumed AC->battery efficiency
 
 # ---------------------------------------------------------------------------
 # AppState: zentrale Zustandsklasse
@@ -93,6 +97,13 @@ class AppState:
         # Flag: gerade von monitor_only → pv_surplus gewechselt
         self.just_switched_to_pv = False
 
+        # SoC estimation state (Renault SoC anchor + energy from go-e)
+        self.soc_anchor: float | None = None              # last real Renault SoC [%]
+        self.soc_anchor_ts: datetime | None = None        # timestamp of anchor
+        self.energy_since_anchor_Wh: float | None = None  # energy [Wh] since anchor
+        self.last_wh_since_connected: float | None = None # last raw 'wh' reading
+        self.soc_estimated: float | None = None           # estimated SoC [%]
+
         # Gemeinsamer Status
         self.status = {
             "timestamp": None,
@@ -111,6 +122,7 @@ class AppState:
             "mode": "pv_surplus",       # oder "monitor_only"
             "car_state": None,
             "soc_protection": True,     # stoppe Ladung, wenn SoC ausreichend hoch
+            "car_soc_est": None,        # optional: estimated SoC for Debug/Dashboard
 
             # Fahrzeugstatus (Renault)
             "car_soc": None,
@@ -123,6 +135,8 @@ class AppState:
         }
 
         self.lock = threading.Lock()
+
+        print("[Debug] AppState.__init__ completed")
 
     # ------------------------------------------------------------------
     # Mode-Handling
@@ -225,82 +239,339 @@ class AppState:
             self.status["current"] = current_live
             # grid_kw_avg, wb_kw_avg, p_available_kw werden im Control-Step gesetzt
 
-    def update_car_status(self) -> None:
-        """Fetch car battery status via CarClient and update status dict.
 
-        Wird im Hintergrundthread alle CAR_STATUS_PERIOD Sekunden aufgerufen.
+    def update_car_status(self) -> None:
         """
-        # Wenn kein CarClient existiert (z.B. keine Credentials): nichts tun
+        Fetch car status from Renault API and update shared status dict.
+        Also update the SoC anchor for the SoC estimation, if possible.
+
+        Diese Methode ist defensiv implementiert:
+        - Wenn kein CarClient vorhanden ist -> sofortiger Rücksprung.
+        - CarClientError wird abgefangen und als car_status_valid=False markiert.
+        - Unerwartete Exceptions werden mit traceback geloggt, car_status_valid=False.
+        """
+        # Kein CarClient? -> nichts tun
         if self.car_client is None:
+            # Debug-Info für Entwicklung; später ggf. kommentieren
+            print("[Debug] update_car_status: no CarClient, skipping.")
             return
+
+        print("[Debug] update_car_status: calling car_client.read_status()")
 
         try:
-            car_status = self.car_client.read_status()
+            cs = self.car_client.read_status()
+            print(
+                f"[Debug] update_car_status: CarStatus received: "
+                f"soc={cs.soc}, autonomy={cs.autonomy_km}, "
+                f"plug={cs.plug_status}, charging={cs.charging_status}, "
+                f"timestamp={cs.timestamp}"
+            )
         except CarClientError as e:
-            print(f"[Warn] Car status read error: {e}")
-            # nur Zeitstempel aktualisieren, damit man sieht, dass es versucht wurde
+            print(f"[Warn] CarClient error: {e}")
             with self.lock:
                 self.status["car_status_valid"] = False
-                self.status["car_status_last_attempt"] = datetime.now().isoformat(timespec="seconds")
+                self.status["car_status_last_attempt"] = datetime.now().isoformat()
+            return
+        except Exception:
+            print("[Error] Unexpected exception in update_car_status:")
+            traceback.print_exc()
+            with self.lock:
+                self.status["car_status_valid"] = False
+                self.status["car_status_last_attempt"] = datetime.now().isoformat()
             return
 
+        # ------------------------------------------------------------------
+        # Basis-Fahrzeugstatus im gemeinsamen Status-Dict aktualisieren
+        # ------------------------------------------------------------------
+        ts_iso: str | None = None
+        if cs.timestamp is not None:
+            ts_iso = cs.timestamp.isoformat()
+
         with self.lock:
-            self.status["car_soc"]                  = car_status.soc
-            self.status["car_autonomy_km"]          = car_status.autonomy_km
-            self.status["car_plug_status"]          = car_status.plug_status
-            self.status["car_charging_status"]      = car_status.charging_status
-            self.status["car_status_timestamp"]     = car_status.timestamp.isoformat(timespec="seconds")
-            self.status["car_status_valid"]         = True
-            self.status["car_status_last_attempt"]  = car_status.timestamp.isoformat(timespec="seconds")
+            self.status["car_soc"] = cs.soc
+            self.status["car_autonomy_km"] = cs.autonomy_km
+            self.status["car_plug_status"] = cs.plug_status
+            self.status["car_charging_status"] = cs.charging_status
+            self.status["car_status_timestamp"] = ts_iso
+            self.status["car_status_valid"] = True
+            self.status["car_status_last_attempt"] = datetime.now().isoformat()
+
+        # ------------------------------------------------------------------
+        # SoC-Anker für Schätzung setzen (nur wenn genügend Infos vorliegen)
+        # ------------------------------------------------------------------
+        try:
+            try:
+                connected = self.wb.is_vehicle_connected()
+            except WallboxError as e:
+                print(f"[Warn] Wallbox error in SoC anchor check: {e}")
+                connected = False
+
+            wh_now: float | None = None
+            if connected and self.charger is not None:
+                try:
+                    wh_now = self.charger.get_energy_since_connected_wh()
+                    print(f"[Debug] update_car_status: wh_now={wh_now}")
+                except SimpleGoEClientError as e:
+                    print(f"[Warn] Error reading 'wh' for SoC anchor: {e}")
+                    wh_now = None
+
+            # Bisherigen Ankerzustand lesen
+            with self.lock:
+                old_anchor_soc = self.soc_anchor
+                old_anchor_ts = self.soc_anchor_ts
+
+            # Kriterien für neuen Anker:
+            # - Fahrzeug verbunden
+            # - wh_now vorhanden
+            # - SoC gültig
+            # - Timestamp vorhanden
+            # - und entweder:
+            #   * bisher kein Anker, oder
+            #   * neuer Timestamp > alter Anker-Timestamp
+            if (
+                connected
+                and wh_now is not None
+                and cs.soc is not None
+                and 0.0 <= cs.soc <= 100.0
+                and cs.timestamp is not None
+            ):
+                is_newer_ts = (
+                    old_anchor_ts is None
+                    or cs.timestamp > old_anchor_ts
+                )
+
+                if is_newer_ts:
+                    with self.lock:
+                        self.soc_anchor = cs.soc
+                        self.soc_anchor_ts = cs.timestamp
+                        self.energy_since_anchor_Wh = 0.0
+                        self.last_wh_since_connected = wh_now
+                        self.soc_estimated = cs.soc
+                        self.status["car_soc_est"] = cs.soc
+
+                    print(
+                        f"[SoC] New anchor set: SoC={cs.soc:.1f} %, "
+                        f"ts={cs.timestamp.isoformat()}, wh={wh_now:.1f}"
+                    )
+                else:
+                    # Timestamp ist nicht neuer – Anker bleibt unverändert
+                    print(
+                        "[Debug] update_car_status: existing anchor kept "
+                        f"(old_ts={old_anchor_ts}, new_ts={cs.timestamp})"
+                    )
+            else:
+                print(
+                    "[Debug] update_car_status: SoC anchor not set "
+                    "(connected=%s, wh_now=%r, soc=%r, ts=%r)"
+                    % (connected, wh_now, cs.soc, cs.timestamp)
+                )
+
+        except Exception:
+            print("[Error] Unexpected exception in SoC anchor logic (update_car_status):")
+            traceback.print_exc()
+
 
 
     def check_battery_saving_stop(self) -> tuple[bool, float | None]:
-        """Return (battery_saving_stop, soc_value).
-
-        battery_saving_stop ist nur dann True, wenn:
-        - car_status_valid == True
-        - car_soc in [0, 100]
-        - car_status_timestamp existiert und jünger als BATTERY_SAVING_MAX_AGE_SEC ist
-        - car_soc >= BATTERY_SAVING_SOC_LIMIT
-
-        Bei Fehlern oder fehlenden/alten Daten immer (False, None).
         """
+        Entscheidet, ob aus Batterieschutz-Gründen die Ladung gestoppt werden soll.
+
+        Priorität:
+        1) Frischer, gültiger Renault-SoC (car_soc):
+            - car_status_valid == True
+            - Timestamp vorhanden und nicht älter als BATTERY_SAVING_MAX_AGE_SEC
+            - SoC >= BATTERY_SAVING_SOC_LIMIT
+
+        2) Falls 1) keinen Stopp auslöst:
+            Geschätzter SoC (car_soc_est), wenn vorhanden und >= Limit.
+
+        Rückgabe:
+            (battery_saving_stop, soc_value)
+
+        soc_value ist der SoC, der für die Entscheidung herangezogen wurde
+        (zuerst realer SoC, sonst ggf. geschätzter SoC, sonst None).
+        """
+
         battery_saving_stop = False
-        soc_value = None
+        soc_value: float | None = None
+
         try:
             with self.lock:
-                soc_value = self.status.get("car_soc")
+                est_soc = self.status.get("car_soc_est")
+                raw_soc = self.status.get("car_soc")
                 ts_str = self.status.get("car_status_timestamp")
                 valid = self.status.get("car_status_valid", False)
 
-            if valid and soc_value is not None and isinstance(soc_value, (int, float)):
-                ts = None
-                if ts_str:
+            # ----------------------------------------------------------
+            # 1) Vorrangig: realer Renault-SoC mit Altersprüfung
+            # ----------------------------------------------------------
+            if isinstance(raw_soc, (int, float)):
+                soc_real_f = float(raw_soc)
+                soc_value = soc_real_f  # wird auch im Fehler-/No-Stop-Fall zurückgegeben
+
+                # Nur wenn Status gültig und Timestamp vorhanden, kann ein Stopp erfolgen
+                if valid and ts_str:
                     try:
                         ts = datetime.fromisoformat(ts_str)
                     except Exception:
                         ts = None
 
-                if ts is not None:
-                    if ts.tzinfo is not None:
-                        now = datetime.now(ts.tzinfo)
-                    else:
-                        now = datetime.now()
-                    age_sec = (now - ts).total_seconds()
+                    if ts is not None:
+                        if ts.tzinfo is not None:
+                            now = datetime.now(ts.tzinfo)
+                        else:
+                            now = datetime.now()
 
+                        age_sec = (now - ts).total_seconds()
+                    else:
+                        age_sec = None
+
+                    # Daten müssen frisch sein
                     if (
-                        0.0 <= soc_value <= 100.0 and
-                        0.0 <= age_sec <= BATTERY_SAVING_MAX_AGE_SEC and
-                        soc_value >= BATTERY_SAVING_SOC_LIMIT
+                        age_sec is not None
+                        and 0.0 <= age_sec <= BATTERY_SAVING_MAX_AGE_SEC
+                        and 0.0 <= soc_real_f <= 100.0
+                        and soc_real_f >= BATTERY_SAVING_SOC_LIMIT
                     ):
-                        battery_saving_stop = True
+                        return True, soc_real_f
+                # Falls valid=False, kein Timestamp oder zu alt:
+                # kein Stopp, aber soc_value bleibt gesetzt
+
+            # ----------------------------------------------------------
+            # 2) Falls kein Stopp durch realen SoC: geschätzten SoC prüfen
+            # ----------------------------------------------------------
+            if isinstance(est_soc, (int, float)):
+                soc_est_f = float(est_soc)
+
+                # Wenn bisher kein soc_value gesetzt wurde, diesen hier verwenden
+                if soc_value is None:
+                    soc_value = soc_est_f
+
+                if 0.0 <= soc_est_f <= 100.0 and soc_est_f >= BATTERY_SAVING_SOC_LIMIT:
+                    return True, soc_est_f
+
+            # ----------------------------------------------------------
+            # Kein Stopp, soc_value ggf. aus realem oder geschätztem SoC
+            # ----------------------------------------------------------
+            return False, soc_value
 
         except Exception as e:
             print(f"[Debug] battery_saving_stop evaluation error: {e}")
-            battery_saving_stop = False
+            return False, None
 
-        return battery_saving_stop, soc_value
 
+
+
+
+    # ------------------------------------------------------------------
+    # SoC estimation based on energy since last Renault SoC anchor
+    # ------------------------------------------------------------------
+    def update_soc_estimate(self) -> None:
+        """
+        Update energy_since_anchor_Wh and soc_estimated using go-e 'wh'
+        and the last Renault SoC anchor.
+
+        This method assumes:
+        - the anchor (soc_anchor, energy_since_anchor_Wh) has been set
+        - estimation is only valid while a vehicle is connected
+        """
+        try:
+            with self.lock:
+                soc_anchor = self.soc_anchor
+                energy_since_anchor_Wh = self.energy_since_anchor_Wh
+                last_wh = self.last_wh_since_connected
+
+            # No anchor -> nothing to do
+            if soc_anchor is None or energy_since_anchor_Wh is None:
+                return
+
+            # Check vehicle connection
+            try:
+                connected = self.wb.is_vehicle_connected()
+            except WallboxError as e:
+                print(f"[Warn] Wallbox error in SoC estimation: {e}")
+                connected = False
+
+            if not connected:
+                # Reset estimator if vehicle is no longer connected
+                with self.lock:
+                    self.soc_anchor = None
+                    self.soc_anchor_ts = None
+                    self.energy_since_anchor_Wh = None
+                    self.last_wh_since_connected = None
+                    self.soc_estimated = None
+                    self.status["car_soc_est"] = None
+                print("[SoC] Vehicle not connected – resetting SoC estimator.")
+                return
+
+            # Need charger and 'wh'
+            if self.charger is None:
+                return
+
+            try:
+                wh_now = self.charger.get_energy_since_connected_wh()
+            except SimpleGoEClientError as e:
+                print(f"[Warn] Error reading 'wh' from charger: {e}")
+                return
+
+            if wh_now is None:
+                return
+
+            # Compute delta energy since last loop
+            if last_wh is None:
+                deltaE_Wh = 0.0
+            else:
+                delta_raw = wh_now - last_wh
+
+                if delta_raw < -1.0:
+                    # Counter reset or suspicious behaviour -> drop estimator
+                    print(
+                        f"[Warn] go-e 'wh' decreased "
+                        f"(last={last_wh:.1f}, now={wh_now:.1f}) – resetting SoC estimator."
+                    )
+                    with self.lock:
+                        self.soc_anchor = None
+                        self.soc_anchor_ts = None
+                        self.energy_since_anchor_Wh = None
+                        self.last_wh_since_connected = wh_now
+                        self.soc_estimated = None
+                        self.status["car_soc_est"] = None
+                    return
+                elif delta_raw < 0.0:
+                    deltaE_Wh = 0.0
+                else:
+                    deltaE_Wh = delta_raw
+
+            # Update cumulative energy since anchor
+            energy_since_anchor_Wh += deltaE_Wh
+
+            # Estimate SoC increase
+            delta_soc = 0.0
+            if BATTERY_CAPACITY_KWH > 0.0 and CHARGING_EFFICIENCY > 0.0:
+                delta_soc = (
+                    (energy_since_anchor_Wh / 1000.0)
+                    * CHARGING_EFFICIENCY
+                    / BATTERY_CAPACITY_KWH
+                    * 100.0
+                )
+
+            soc_est = soc_anchor + delta_soc
+            soc_est = max(0.0, min(100.0, soc_est))
+
+            with self.lock:
+                self.energy_since_anchor_Wh = energy_since_anchor_Wh
+                self.last_wh_since_connected = wh_now
+                self.soc_estimated = soc_est
+                self.status["car_soc_est"] = soc_est
+
+            print(
+                f"[SoC] Estimated SoC={soc_est:.1f} % "
+                f"(anchor={soc_anchor:.1f} %, "
+                f"energy_since_anchor={energy_since_anchor_Wh:.1f} Wh)"
+            )
+
+        except Exception as e:
+            print(f"[Warn] Error in update_soc_estimate: {e}")
 
     # ------------------------------------------------------------------
     # Hauptschleife (Background-Thread)
@@ -308,6 +579,7 @@ class AppState:
     def run_loop(self):
         while True:
             try:
+
                 # Live snapshot for dashboard
                 self.update_instant_snapshot()
 
@@ -330,6 +602,7 @@ class AppState:
                 # ----------------------------------------------------------
                 if self.car_status_counter == 0:
                     self.update_car_status()
+                    
 
                 # Query mode
                 mode = self.get_mode()
@@ -358,11 +631,16 @@ class AppState:
 
                 # ----------------------------------------------------------
                 # Unified SoC-check (only once per loop if relevant)
+                # SoC estimation is only updated if there is a reason to 
+                # check protection
                 # ----------------------------------------------------------
                 battery_saving_stop = False
                 soc_value = None
 
                 if soc_protection and (trigger_control or soc_control):
+                    # Update SoC estimation before evaluating protection
+                    self.update_soc_estimate()
+
                     battery_saving_stop, soc_value = self.check_battery_saving_stop()
 
                 # ----------------------------------------------------------
@@ -438,10 +716,12 @@ class AppState:
                 self.soc_counter = (self.soc_counter + 1) % BATTERY_SAVING_CHECK_PERIOD
                 self.car_status_counter = (self.car_status_counter + 1) % CAR_STATUS_PERIOD
 
-            except Exception as e:
-                print(f"[Error] main loop: {e}")
+            except Exception:
+                print("[Error] main loop exception:")
+                traceback.print_exc()
 
             time.sleep(SAMPLE_INTERVAL_SEC)
+
 
 
     # ------------------------------------------------------------------
@@ -842,6 +1122,27 @@ HTML_PAGE = """
 
 
 <script>
+
+    function formatTimestampLocal(isoStr) {
+        if (!isoStr) {
+            return "–";
+        }
+        try {
+            const date = new Date(isoStr);
+            // Lokale Zeit in deutscher Formatierung
+            return date.toLocaleString("de-DE", {
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit"
+            });
+        } catch (e) {
+            return isoStr;  // Fallback
+        }
+    }
+
     function formatKw(value) {
         if (value === null || value === undefined || isNaN(value)) {
             return "– kW";
@@ -921,7 +1222,10 @@ HTML_PAGE = """
             data.car_charging_status != null ? data.car_charging_status : "–";
 
         document.getElementById("car_status_timestamp").textContent =
-            data.car_status_timestamp != null ? data.car_status_timestamp : "–";
+            data.car_status_timestamp != null
+                ? formatTimestampLocal(data.car_status_timestamp)
+                : "–";
+
 
 
         // PV, Grid, WB, P_available_now
@@ -1057,6 +1361,7 @@ def index():
 
 def start_background_loop():
     t = threading.Thread(target=app_state.run_loop, daemon=True)
+    print("[Debug] Starting AppState.run_loop thread...")
     t.start()
 
 
