@@ -75,13 +75,26 @@ class CarClient:
             vehicle = await account.get_api_vehicle(vin)
             battery = await vehicle.get_battery_status()
 
-            now = datetime.now()
+            # Renault liefert z.B. "2025-12-01T22:02:51Z"
+            ts_raw = getattr(battery, "timestamp", None)
+
+            if isinstance(ts_raw, str):
+                # ISO-String mit 'Z' → in gültiges ISO-Format konvertieren
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                except Exception:
+                    ts = None
+            elif isinstance(ts_raw, datetime):
+                ts = ts_raw
+            else:
+                ts = None   # kein Timestamp → None
+
             return CarStatus(
                 soc=battery.batteryLevel,
                 autonomy_km=battery.batteryAutonomy,
                 plug_status=battery.plugStatus,
                 charging_status=battery.chargingStatus,
-                timestamp=now,
+                timestamp=ts,    # None oder echter Messzeitpunkt
             )
 
     def read_status(self) -> CarStatus:
