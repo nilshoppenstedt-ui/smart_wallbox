@@ -6,3 +6,5 @@ requests
 pytest
 renault-api
 #cryptography<39
+renault-api>=0.5.10
+brotlicffi
